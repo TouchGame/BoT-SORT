@@ -49,7 +49,7 @@ def get_color(idx):
     return color
 
 
-def plot_tracking(image, tlwhs, obj_ids, scores=None, frame_id=0, fps=0., ids2=None):
+def plot_tracking(image, tlwhs, obj_ids, scores=None, frame_id=0, fps=0., ids2=None, employee_ids=None):
     im = np.ascontiguousarray(np.copy(image))
     im_h, im_w = im.shape[:2]
 
@@ -70,10 +70,31 @@ def plot_tracking(image, tlwhs, obj_ids, scores=None, frame_id=0, fps=0., ids2=N
         x1, y1, w, h = tlwh
         intbox = tuple(map(int, (x1, y1, x1 + w, y1 + h)))
         obj_id = int(obj_ids[i])
-        id_text = '{}'.format(int(obj_id))
+
+        # Determine color and label based on employee_id
+        has_employee = employee_ids is not None and i < len(employee_ids) and employee_ids[i] is not None
+
+        if has_employee:
+            # Use employee_id for color
+            emp_id = employee_ids[i]
+            if isinstance(emp_id, str) and emp_id.startswith('emp_'):
+                color_id = int(emp_id.split('_')[1])
+            else:
+                color_id = int(emp_id) if isinstance(emp_id, int) else obj_id
+            color = get_color(abs(color_id))
+            # Label: E{emp_num}:{track_id}
+            if isinstance(emp_id, str) and emp_id.startswith('emp_'):
+                emp_num = int(emp_id.split('_')[1])
+            else:
+                emp_num = emp_id
+            id_text = 'E{}:{}'.format(emp_num, int(obj_id))
+        else:
+            # No employee_id - gray box
+            color = (128, 128, 128)
+            id_text = '{}'.format(int(obj_id))
+
         if ids2 is not None:
             id_text = id_text + ', {}'.format(int(ids2[i]))
-        color = get_color(abs(obj_id))
         cv2.rectangle(im, intbox[0:2], intbox[2:4], color=color, thickness=line_thickness)
         cv2.putText(im, id_text, (intbox[0], intbox[1]), cv2.FONT_HERSHEY_PLAIN, text_scale, (0, 0, 255),
                     thickness=text_thickness)

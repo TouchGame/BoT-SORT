@@ -21,7 +21,7 @@ IMAGE_EXT = [".jpg", ".jpeg", ".webp", ".bmp", ".png"]
 
 
 def make_parser():
-    parser = argparse.ArgumentParser("BoT-SORT Demo!")
+    parser = argparse.ArgumentParser("BoT-SORT Realtime Demo!")
     parser.add_argument("demo", default="image", help="demo type, eg. image, video and webcam")
     parser.add_argument("-expn", "--experiment-name", type=str, default=None)
     parser.add_argument("-n", "--name", type=str, default=None, help="model name")
@@ -34,8 +34,7 @@ def make_parser():
     parser.add_argument("--conf", default=None, type=float, help="test conf")
     parser.add_argument("--nms", default=None, type=float, help="test nms threshold")
     parser.add_argument("--tsize", default=None, type=int, help="test img size")
-    parser.add_argument("--fps", default=30, type=int, help="frame rate (fps) for tracking buffer calculation")
-    parser.add_argument("--video-fps", default=None, type=float, help="actual video frame rate for timestamp calculation (default: same as --fps)")
+    parser.add_argument("--fps", default=30, type=int, help="frame rate (fps)")
     parser.add_argument("--fp16", dest="fp16", default=False, action="store_true",help="Adopting mix precision evaluating.")
     parser.add_argument("--fuse", dest="fuse", default=False, action="store_true", help="Fuse conv and bn for testing.")
     parser.add_argument("--trt", dest="trt", default=False, action="store_true", help="Using TensorRT model for testing.")
@@ -44,7 +43,7 @@ def make_parser():
     parser.add_argument("--track_high_thresh", type=float, default=0.6, help="tracking confidence threshold")
     parser.add_argument("--track_low_thresh", default=0.1, type=float, help="lowest detection threshold")
     parser.add_argument("--new_track_thresh", default=0.7, type=float, help="new track thresh")
-    parser.add_argument("--track_buffer", type=int, default=60, help="the frames for keep lost tracks")
+    parser.add_argument("--track_buffer", type=int, default=30, help="the frames for keep lost tracks")
     parser.add_argument("--match_thresh", type=float, default=0.8, help="matching threshold for tracking")
     parser.add_argument("--aspect_ratio_thresh", type=float, default=1.6, help="threshold for filtering out boxes of which aspect ratio are above the given value.")
     parser.add_argument('--min_box_area', type=float, default=10, help='filter out tiny boxes')
@@ -59,11 +58,6 @@ def make_parser():
     parser.add_argument("--fast-reid-weights", dest="fast_reid_weights", default=r"pretrained/mot17_sbs_S50.pth", type=str,help="reid config file path")
     parser.add_argument('--proximity_thresh', type=float, default=0.5, help='threshold for rejecting low overlap reid matches')
     parser.add_argument('--appearance_thresh', type=float, default=0.25, help='threshold for rejecting low appearance similarity reid matches')
-
-    # Employee Registry
-    parser.add_argument("--with-employee-registry", dest="with_employee_registry", default=False, action="store_true", help="enable employee identity registry")
-    parser.add_argument("--with-face-registry", dest="with_face_registry", default=False, action="store_true", help="enable face recognition for identity verification")
-
     return parser
 
 
@@ -146,82 +140,7 @@ class Predictor(object):
             if self.decoder is not None:
                 outputs = self.decoder(outputs, dtype=outputs.type())
             outputs = postprocess(outputs, self.num_classes, self.confthre, self.nmsthre)
-            timer.toc()
         return outputs, img_info
-
-
-def image_demo(predictor, vis_folder, current_time, args):
-    if osp.isdir(args.path):
-        files = get_image_list(args.path)
-    else:
-        files = [args.path]
-    files.sort()
-
-    tracker = BoTSORT(args, frame_rate=args.fps, video_fps=args.video_fps or args.fps)
-
-    timer = Timer()
-    results = []
-
-    for frame_id, img_path in enumerate(files, 1):
-
-        # Detect objects
-        outputs, img_info = predictor.inference(img_path, timer)
-        scale = min(exp.test_size[0] / float(img_info['height'], ), exp.test_size[1] / float(img_info['width']))
-
-        detections = []
-        if outputs[0] is not None:
-            outputs = outputs[0].cpu().numpy()
-            detections = outputs[:, :7]
-            detections[:, :4] /= scale
-
-            # Run tracker
-            online_targets = tracker.update(detections, img_info['raw_img'])
-
-            online_tlwhs = []
-            online_ids = []
-            online_scores = []
-            online_employee_ids = []
-            for t in online_targets:
-                tlwh = t.tlwh
-                tid = t.track_id
-                vertical = tlwh[2] / tlwh[3] > args.aspect_ratio_thresh
-                if tlwh[2] * tlwh[3] > args.min_box_area and not vertical:
-                    online_tlwhs.append(tlwh)
-                    online_ids.append(tid)
-                    online_scores.append(t.score)
-                    online_employee_ids.append(getattr(t, 'employee_id', None))
-                    # save results
-                    results.append(
-                        f"{frame_id},{tid},{tlwh[0]:.2f},{tlwh[1]:.2f},{tlwh[2]:.2f},{tlwh[3]:.2f},{t.score:.2f},-1,-1,-1\n"
-                    )
-            timer.toc()
-            online_im = plot_tracking(
-                img_info['raw_img'], online_tlwhs, online_ids, frame_id=frame_id, fps=1. / timer.average_time,
-                employee_ids=online_employee_ids
-            )
-        else:
-            timer.toc()
-            online_im = img_info['raw_img']
-
-        # result_image = predictor.visual(outputs[0], img_info, predictor.confthre)
-        if args.save_result:
-            timestamp = time.strftime("%Y_%m_%d_%H_%M_%S", current_time)
-            save_folder = osp.join(vis_folder, timestamp)
-            os.makedirs(save_folder, exist_ok=True)
-            cv2.imwrite(osp.join(save_folder, osp.basename(img_path)), online_im)
-
-        if frame_id % 20 == 0:
-            logger.info('Processing frame {} ({:.2f} fps)'.format(frame_id, 1. / max(1e-5, timer.average_time)))
-
-        ch = cv2.waitKey(0)
-        if ch == 27 or ch == ord("q") or ch == ord("Q"):
-            break
-
-    if args.save_result:
-        res_file = osp.join(vis_folder, f"{timestamp}.txt")
-        with open(res_file, 'w') as f:
-            f.writelines(results)
-        logger.info(f"save results to {res_file}")
 
 
 def imageflow_demo(predictor, vis_folder, current_time, args):
@@ -240,10 +159,15 @@ def imageflow_demo(predictor, vis_folder, current_time, args):
     vid_writer = cv2.VideoWriter(
         save_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (int(width), int(height))
     )
-    tracker = BoTSORT(args, frame_rate=args.fps, video_fps=args.video_fps or args.fps)
+    tracker = BoTSORT(args, frame_rate=args.fps)
     timer = Timer()
     frame_id = 0
     results = []
+
+    # Create window for real-time display
+    window_name = "BoT-SORT Realtime"
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+
     while True:
         if frame_id % 20 == 0:
             logger.info('Processing frame {} ({:.2f} fps)'.format(frame_id, 1. / max(1e-5, timer.average_time)))
@@ -264,7 +188,6 @@ def imageflow_demo(predictor, vis_folder, current_time, args):
                 online_tlwhs = []
                 online_ids = []
                 online_scores = []
-                online_employee_ids = []
                 for t in online_targets:
                     tlwh = t.tlwh
                     tid = t.track_id
@@ -273,26 +196,35 @@ def imageflow_demo(predictor, vis_folder, current_time, args):
                         online_tlwhs.append(tlwh)
                         online_ids.append(tid)
                         online_scores.append(t.score)
-                        online_employee_ids.append(getattr(t, 'employee_id', None))
                         results.append(
                             f"{frame_id},{tid},{tlwh[0]:.2f},{tlwh[1]:.2f},{tlwh[2]:.2f},{tlwh[3]:.2f},{t.score:.2f},-1,-1,-1\n"
                         )
                 timer.toc()
                 online_im = plot_tracking(
-                    img_info['raw_img'], online_tlwhs, online_ids, frame_id=frame_id + 1, fps=1. / timer.average_time,
-                    employee_ids=online_employee_ids
+                    img_info['raw_img'], online_tlwhs, online_ids, frame_id=frame_id + 1, fps=1. / timer.average_time
                 )
             else:
                 timer.toc()
                 online_im = img_info['raw_img']
+
+            # Save to video file if enabled
             if args.save_result:
                 vid_writer.write(online_im)
+
+            # Real-time display
+            cv2.imshow(window_name, online_im)
+
+            # Press 'q' or ESC to quit
             ch = cv2.waitKey(1)
             if ch == 27 or ch == ord("q") or ch == ord("Q"):
                 break
         else:
             break
         frame_id += 1
+
+    # Cleanup
+    cap.release()
+    cv2.destroyAllWindow()
 
     if args.save_result:
         res_file = osp.join(vis_folder, f"{timestamp}.txt")
@@ -308,9 +240,8 @@ def main(exp, args):
     output_dir = osp.join(exp.output_dir, args.experiment_name)
     os.makedirs(output_dir, exist_ok=True)
 
-    if args.save_result:
-        vis_folder = osp.join(output_dir, "track_vis")
-        os.makedirs(vis_folder, exist_ok=True)
+    vis_folder = osp.join(output_dir, "track_vis")
+    os.makedirs(vis_folder, exist_ok=True)
 
     if args.trt:
         args.device = "gpu"
@@ -363,7 +294,7 @@ def main(exp, args):
     predictor = Predictor(model, exp, trt_file, decoder, args.device, args.fp16)
     current_time = time.localtime()
     if args.demo == "image" or args.demo == "images":
-        image_demo(predictor, vis_folder, current_time, args)
+        raise ValueError("Realtime demo only supports video or webcam!")
     elif args.demo == "video" or args.demo == "webcam":
         imageflow_demo(predictor, vis_folder, current_time, args)
     else:

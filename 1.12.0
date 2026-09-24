@@ -1,0 +1,19 @@
+Collecting onnx
+  Downloading onnx-1.23.0-cp310-cp310-win_amd64.whl.metadata (8.7 kB)
+Requirement already satisfied: numpy>=1.23.2 in d:\miniconda3\envs\botsort\lib\site-packages (from onnx) (2.2.6)
+Collecting protobuf>=6.31.1 (from onnx)
+  Using cached protobuf-7.36.2-cp310-abi3-win_amd64.whl.metadata (595 bytes)
+Requirement already satisfied: typing_extensions>=4.7.1 in d:\miniconda3\envs\botsort\lib\site-packages (from onnx) (4.13.2)
+Collecting ml_dtypes>=0.5.4 (from onnx)
+  Downloading ml_dtypes-0.6.0-cp310-cp310-win_amd64.whl.metadata (8.8 kB)
+Downloading onnx-1.23.0-cp310-cp310-win_amd64.whl (7.9 MB)
+   ---------------------------------------- 7.9/7.9 MB 14.8 MB/s  0:00:00
+Downloading ml_dtypes-0.6.0-cp310-cp310-win_amd64.whl (433 kB)
+Using cached protobuf-7.36.2-cp310-abi3-win_amd64.whl (456 kB)
+Installing collected packages: protobuf, ml_dtypes, onnx
+  Attempting uninstall: protobuf
+    Found existing installation: protobuf 5.29.6
+    Uninstalling protobuf-5.29.6:
+      Successfully uninstalled protobuf-5.29.6
+
+Successfully installed ml_dtypes-0.6.0 onnx-1.23.0 protobuf-7.36.2
