@@ -45,10 +45,12 @@ class STrack(BaseTrack):
 
         # Employee identity tracking
         self.employee_id = None
+        self.birth_pos = None  # Foot point at track birth; anchors the position bonus at stable re-check
         self.stable_count = 0
+        self.face_pending_verify = False  # True when identity was assigned body-only, awaiting face confirmation
 
         # Face feature buffer: accumulate face features before identity assignment
-        self.face_features_buffer = []  # [(feature, frame_id, quality_score), ...]
+        self.face_features_buffer = []  # [(feature, frame_id, quality_score, pose_label), ...]
 
     def update_features(self, feat):
         feat /= np.linalg.norm(feat)
@@ -253,8 +255,10 @@ class BoTSORT(object):
         if self.with_employee_registry:
             self.employee_registry = EmployeeRegistry()
             self.min_track_length = self.employee_registry.config.MIN_TRACK_LENGTH
+            self.employee_presence = {}  # {employee_id: last_frame_seen}
         else:
             self.employee_registry = None
+            self.employee_presence = {}
 
         # Face registry for face-based identity verification
         self.with_face_registry = getattr(args, 'with_face_registry', False)
@@ -380,10 +384,13 @@ class BoTSORT(object):
                 track.update(detections[idet], self.frame_id)
                 activated_starcks.append(track)
             else:
+                old_smooth_feat = track.smooth_feat.copy() if track.smooth_feat is not None else None
+                was_lost_for = self.frame_id - track.frame_id
                 track.re_activate(det, self.frame_id, new_id=False)
                 refind_stracks.append(track)
+                track._pre_reactivation_smooth_feat = old_smooth_feat
                 logger.debug(f"[{self.video_time:.2f}s] TRACK RE-ACTIVATED: track_id={track.track_id}, employee_id={track.employee_id}, "
-                           f"was_lost_for={self.frame_id - track.frame_id} frames")
+                           f"was_lost_for={was_lost_for} frames")
 
         ''' Step 3: Second association, with low score detection boxes'''
         if len(scores):
@@ -416,10 +423,13 @@ class BoTSORT(object):
                 track.update(det, self.frame_id)
                 activated_starcks.append(track)
             else:
+                old_smooth_feat = track.smooth_feat.copy() if track.smooth_feat is not None else None
+                was_lost_for = self.frame_id - track.frame_id
                 track.re_activate(det, self.frame_id, new_id=False)
                 refind_stracks.append(track)
+                track._pre_reactivation_smooth_feat = old_smooth_feat
                 logger.debug(f"[{self.video_time:.2f}s] TRACK RE-ACTIVATED (2nd assoc): track_id={track.track_id}, "
-                           f"employee_id={track.employee_id}")
+                           f"employee_id={track.employee_id}, was_lost_for={was_lost_for} frames")
 
         for it in u_track:
             track = r_tracked_stracks[it]
@@ -461,13 +471,15 @@ class BoTSORT(object):
                 continue
 
             track.activate(self.kalman_filter, self.frame_id)
+            if self.with_employee_registry:
+                track.birth_pos = self.employee_registry.foot_point(track.tlbr)
             logger.debug(f"[{self.video_time:.2f}s] NEW TRACK: track_id={track.track_id}, score={track.score:.3f}")
 
             # Try to identify new track via employee registry
-            if self.with_employee_registry and track.smooth_feat is not None:
+            if self.with_employee_registry and track.curr_feat is not None:
                 # Get set of employee_ids that already have active or lost tracks
                 active_employee_ids = {t.employee_id for t in self.tracked_stracks + activated_starcks if t.employee_id is not None}
-                active_employee_ids |= {t.employee_id for t in self.lost_stracks if t.employee_id is not None}
+                query_pos = self.employee_registry.foot_point(track.tlbr)
 
                 all_distances = []
                 for emp_id_iter, gallery in self.employee_registry.galleries.items():
@@ -479,45 +491,59 @@ class BoTSORT(object):
                     gallery_frames = np.array([g[1] for g in gallery])
                     distances = self.employee_registry._cosine_distance(track.smooth_feat, gallery_features)
                     age = self.frame_id - gallery_frames
-                    time_weights = np.exp(-self.employee_registry.config.TIME_WEIGHT_DECAY * age)
+                    time_weights = np.maximum(np.exp(-self.employee_registry.config.TIME_WEIGHT_DECAY * age),
+                                              self.employee_registry.config.MIN_TIME_WEIGHT)
                     weighted_distances = distances / time_weights
                     min_dist = np.min(weighted_distances)
-                    all_distances.append((emp_id_iter, min_dist))
+                    bonus = self.employee_registry.position_bonus(emp_id_iter, query_pos, self.frame_id)
+                    all_distances.append((emp_id_iter, min_dist - bonus, bonus))
 
-                emp_id, dist, feat_idx = self.employee_registry.identify(track.smooth_feat, exclude_ids=active_employee_ids, current_frame=self.frame_id)
+                emp_id, dist, feat_idx = self.employee_registry.identify(track.smooth_feat, exclude_ids=active_employee_ids, current_frame=self.frame_id, query_pos=query_pos)
                 all_distances.sort(key=lambda x: x[1])
 
                 # Face detection for new track
                 face_emp_id, face_dist = None, float('inf')
+                face_all_distances = []
+                face_pose_label = 'front'
                 if self.with_face_registry and self.face_analysis.is_available():
                     person_bbox = track.tlbr
-                    face_result = self.face_analysis.extract_face(self._current_img, person_bbox)
+                    face_result = self.face_analysis.extract_face(self._current_img, person_bbox, self.video_time)
                     if face_result is not None:
-                        face_feat, face_score = face_result
+                        face_feat, face_score, face_pose_label, face_yaw = face_result
                         # Add to buffer for later use if not matched immediately
-                        track.face_features_buffer.append((face_feat, self.frame_id, face_score))
-                        face_emp_id, face_dist, face_feat_idx = self.face_registry.identify(
-                            face_feat, exclude_ids=active_employee_ids, current_frame=self.frame_id
+                        track.face_features_buffer.append((face_feat, self.frame_id, face_score, face_pose_label))
+                        logger.debug(f"[{self.video_time:.2f}s] FACE BUFFERED: track_id={track.track_id}, "
+                                   f"pose={face_pose_label}, score={face_score:.2f}, "
+                                   f"buffer_size={len(track.face_features_buffer)}, frame={self.frame_id}")
+                        face_emp_id, face_dist, face_feat_idx, face_all_distances = self.face_registry.identify(
+                            face_feat, exclude_ids=active_employee_ids, current_frame=self.frame_id, return_all=True
                         )
                         # If face matches, prefer face identity
                         if face_emp_id is not None:
                             emp_id = face_emp_id
                             dist = face_dist
-                            self.face_registry.refresh_feature(face_emp_id, face_feat_idx, face_feat, self.frame_id)
-                            self.face_registry.add_features(face_emp_id, face_feat, self.frame_id)
+                            self.face_registry.refresh_feature(face_emp_id, face_feat_idx, face_feat, self.frame_id, face_pose_label)
+                            self.face_registry.add_features(face_emp_id, face_feat, self.frame_id, face_pose_label, self.video_time)
 
                 logger.debug(f"[{self.video_time:.2f}s] REGISTRY CHECK: track_id={track.track_id}, matched={emp_id}, "
-                           f"distance={dist:.4f}, all_distances={[(e, f'{d:.4f}') for e, d in all_distances]}, "
+                           f"distance={dist:.4f}, all_distances(emp,adj,bonus)={[(e, f'{d:.4f}', f'{b:.3f}') for e, d, b in all_distances]}, "
                            f"face_match={face_emp_id}, face_dist={face_dist:.4f}, "
+                           f"face_all={[(e, f'{d:.4f}') for e, d in face_all_distances]}, "
                            f"registry_size={len(self.employee_registry.list_employees())}, active_employees={active_employee_ids}")
                 if emp_id is not None:
                     track.employee_id = emp_id
-                    self.employee_registry.refresh_feature(emp_id, feat_idx, track.smooth_feat, self.frame_id)
-                    pruned = self.employee_registry.prune_gallery(emp_id, track.smooth_feat)
+                    # Set face_pending_verify based on whether face confirmed the match
+                    if face_emp_id is not None and face_emp_id == emp_id:
+                        track.face_pending_verify = False  # Face confirmed
+                    else:
+                        track.face_pending_verify = True  # Body-only, needs face verification
+                    self.employee_registry.refresh_feature(emp_id, feat_idx, track.curr_feat, self.frame_id)
+                    pruned = self.employee_registry.prune_gallery(emp_id, track.curr_feat)
                     # Update face registry if face was detected
                     if face_emp_id is not None and len(track.face_features_buffer) > 0:
                         best_face_feat = track.face_features_buffer[0][0]
-                        self.face_registry.add_features(emp_id, best_face_feat, self.frame_id)
+                        best_face_pose = track.face_features_buffer[0][3]
+                        self.face_registry.add_features(emp_id, best_face_feat, self.frame_id, best_face_pose, self.video_time)
                     track.face_features_buffer = []
 
             activated_starcks.append(track)
@@ -540,9 +566,21 @@ class BoTSORT(object):
         self.removed_stracks.extend(removed_stracks)
         self.tracked_stracks, self.lost_stracks = remove_duplicate_stracks(self.tracked_stracks, self.lost_stracks)
 
+        """ Step 5.4: Verify re-activated tracks (after all frame states are settled) """
+        for track in refind_stracks:
+            old_smooth_feat = getattr(track, '_pre_reactivation_smooth_feat', None)
+            self._verify_reactivated_identity(track, old_smooth_feat)
+
         """ Step 5.5: Collect face features for all tracked tracks """
         if self.with_face_registry and self.face_analysis.is_available():
             self._collect_face_features()
+
+        """ Step 5.6: Update employee presence history and last positions """
+        if self.with_employee_registry:
+            for t in self.tracked_stracks:
+                if t.employee_id is not None:
+                    self.employee_presence[t.employee_id] = self.frame_id
+                    self.employee_registry.update_position(t.employee_id, self.employee_registry.foot_point(t.tlbr), self.frame_id)
 
         """ Step 6: Collect features from stable tracks to employee registry """
         if self.with_employee_registry:
@@ -578,27 +616,28 @@ class BoTSORT(object):
         for track in self.tracked_stracks:
             # Check if we should collect face for this track
             if track.employee_id is not None:
-                # Track has identity - check if gallery is full
-                gallery = self.face_registry.galleries.get(track.employee_id, [])
-                if len(gallery) >= self.face_registry.config.MAX_GALLERY_SIZE:
+                # Track has identity - check if all slots are full
+                pose_galleries = self.face_registry.galleries.get(track.employee_id, {'front': [], 'left': [], 'right': []})
+                total_features = sum(len(pose_galleries[p]) for p in ['front', 'left', 'right'])
+                if total_features >= self.face_registry.config.MAX_GALLERY_SIZE:
                     continue  # Gallery full, skip detection
 
             person_bbox = track.tlbr
-            face_result = self.face_analysis.extract_face(self._current_img, person_bbox)
+            face_result = self.face_analysis.extract_face(self._current_img, person_bbox, self.video_time)
 
             if face_result is None:
                 continue
 
-            face_feat, face_score = face_result
+            face_feat, face_score, face_pose_label, face_yaw = face_result
 
-            if track.employee_id is not None:
-                # Track has identity - add directly to gallery
-                self.face_registry.add_features(track.employee_id, face_feat, self.frame_id)
+            if track.employee_id is not None and not track.face_pending_verify:
+                # Track has identity (already verified) - add directly to gallery
+                self.face_registry.add_features(track.employee_id, face_feat, self.frame_id, face_pose_label, self.video_time)
             else:
-                # Track without identity - store in buffer for later matching
+                # Track without identity OR pending face verification - store in buffer for matching
                 # Deduplication: skip if too similar to existing buffered features
                 is_duplicate = False
-                for existing_feat, _, _ in track.face_features_buffer:
+                for existing_feat, _, _, _ in track.face_features_buffer:
                     similarity = np.dot(face_feat, existing_feat) / (np.linalg.norm(face_feat) * np.linalg.norm(existing_feat) + 1e-8)
                     if similarity > 0.85:
                         is_duplicate = True
@@ -608,7 +647,10 @@ class BoTSORT(object):
                     continue
 
                 # Add to buffer
-                track.face_features_buffer.append((face_feat, self.frame_id, face_score))
+                track.face_features_buffer.append((face_feat, self.frame_id, face_score, face_pose_label))
+                logger.debug(f"[{self.video_time:.2f}s] FACE BUFFERED: track_id={track.track_id}, "
+                           f"pose={face_pose_label}, score={face_score:.2f}, "
+                           f"buffer_size={len(track.face_features_buffer)}, frame={self.frame_id}")
 
                 # Limit buffer size (keep best quality faces)
                 max_buffer_size = 5
@@ -630,17 +672,31 @@ class BoTSORT(object):
         for track in self.tracked_stracks:
             if track.stable_count < self.min_track_length:
                 continue
-            if track.smooth_feat is None:
+            if track.curr_feat is None:
                 continue
 
             # Get active employee IDs (for exclusion)
+            # Include: currently tracked employees + employees seen since this track was born
+            # Exclude: this track's previous employee_id (if any) to allow re-matching
             active_employee_ids = {t.employee_id for t in self.tracked_stracks if t.employee_id is not None}
-            active_employee_ids |= {t.employee_id for t in self.lost_stracks if t.employee_id is not None}
+            for emp_id, last_frame in self.employee_presence.items():
+                if last_frame >= track.start_frame:
+                    active_employee_ids.add(emp_id)
+            # Allow track to re-match its previous employee_id — only if no other
+            # active track currently claims it
+            if hasattr(track, '_previous_employee_id') and track._previous_employee_id is not None:
+                claimed_by_other = any(
+                    t is not track and t.employee_id == track._previous_employee_id
+                    for t in self.tracked_stracks
+                )
+                if not claimed_by_other:
+                    active_employee_ids.discard(track._previous_employee_id)
 
             # Body feature matching
             body_emp_id, body_dist, body_feat_idx = None, float('inf'), -1
             if track.employee_id is None:
-                # Try to identify via body feature
+                # Try to identify via body feature (use the birth-time position, not the moved box)
+                query_pos = track.birth_pos if track.birth_pos is not None else self.employee_registry.foot_point(track.tlbr)
                 all_distances = []
                 for emp_id, gallery in self.employee_registry.galleries.items():
                     if emp_id in active_employee_ids:
@@ -651,13 +707,16 @@ class BoTSORT(object):
                     gallery_frames = np.array([g[1] for g in gallery])
                     distances = self.employee_registry._cosine_distance(track.smooth_feat, gallery_features)
                     age = self.frame_id - gallery_frames
-                    time_weights = np.exp(-self.employee_registry.config.TIME_WEIGHT_DECAY * age)
+                    time_weights = np.maximum(np.exp(-self.employee_registry.config.TIME_WEIGHT_DECAY * age),
+                                              self.employee_registry.config.MIN_TIME_WEIGHT)
                     weighted_distances = distances / time_weights
                     min_dist = np.min(weighted_distances)
-                    all_distances.append((emp_id, min_dist))
+                    bonus = self.employee_registry.position_bonus(emp_id, query_pos, track.start_frame)
+                    all_distances.append((emp_id, min_dist - bonus, bonus))
 
                 body_emp_id, body_dist, body_feat_idx = self.employee_registry.identify(
-                    track.smooth_feat, exclude_ids=active_employee_ids, current_frame=self.frame_id
+                    track.smooth_feat, exclude_ids=active_employee_ids, current_frame=self.frame_id, query_pos=query_pos,
+                    query_frame=track.start_frame
                 )
                 all_distances.sort(key=lambda x: x[1])
                 body_all_distances = all_distances
@@ -667,17 +726,23 @@ class BoTSORT(object):
             # Face feature matching using accumulated buffer
             face_emp_id, face_dist, face_feat_idx, face_score = None, float('inf'), -1, 0.0
             face_feat = None
+            face_pose_label = 'front'
+            face_all_distances = []
             if self.with_face_registry and self.face_analysis.is_available() and len(track.face_features_buffer) > 0:
                 # Match all buffered face features, pick best match
                 face_active_ids = active_employee_ids.copy()
-                face_emp_id, face_dist, face_feat_idx, face_feat = self.face_registry.identify_best_match(
+                # Allow face to match track's own identity for pending verification
+                if track.face_pending_verify and track.employee_id is not None:
+                    face_active_ids.discard(track.employee_id)
+                face_emp_id, face_dist, face_feat_idx, face_feat, face_all_distances = self.face_registry.identify_best_match(
                     track.face_features_buffer, exclude_ids=face_active_ids, current_frame=self.frame_id
                 )
                 if face_feat is not None:
-                    # Get quality score of best face
-                    for buf_feat, buf_fid, buf_score in track.face_features_buffer:
+                    # Get quality score and pose label of best face
+                    for buf_feat, buf_fid, buf_score, buf_pose in track.face_features_buffer:
                         if np.array_equal(buf_feat, face_feat):
                             face_score = buf_score
+                            face_pose_label = buf_pose
                             break
 
             # Cascade verification: determine final identity
@@ -686,48 +751,142 @@ class BoTSORT(object):
                 face_emp_id, face_dist, face_feat_idx, face_feat, face_score
             )
 
+            # Log cascade verification result only when there's data
+            if body_emp_id is not None or face_emp_id is not None or len(track.face_features_buffer) > 0:
+                logger.debug(f"[{self.video_time:.2f}s] CASCADE: track_id={track.track_id}, "
+                           f"body={body_emp_id}(dist={body_dist:.4f}), "
+                           f"face={face_emp_id}(dist={face_dist:.4f}, score={face_score:.2f}, buffer={len(track.face_features_buffer)}), "
+                           f"final={final_emp_id}")
+
             # Update registries based on final identity
             if track.employee_id is None and final_emp_id is not None:
                 track.employee_id = final_emp_id
+                # Set face_pending_verify based on whether face confirmed the match
+                if face_emp_id is not None and face_emp_id == final_emp_id:
+                    track.face_pending_verify = False  # Face confirmed
+                else:
+                    track.face_pending_verify = True  # Body-only, needs face verification later
+                logger.debug(f"[{self.video_time:.2f}s] STABLE MATCH: track_id={track.track_id}, "
+                           f"employee={final_emp_id}, "
+                           f"body_match={body_emp_id}, body_dist={body_dist:.4f}, "
+                           f"body_all(emp,adj,bonus)={[(e, f'{d:.4f}', f'{b:.3f}') for e, d, b in body_all_distances]}, "
+                           f"face_match={face_emp_id}, face_dist={face_dist:.4f}, "
+                           f"face_all={[(e, f'{d:.4f}') for e, d in face_all_distances]}, "
+                           f"face_score={face_score:.2f}, face_buffer={len(track.face_features_buffer)}, "
+                           f"face_pending={track.face_pending_verify}, "
+                           f"registry_size={len(self.employee_registry.list_employees())}, "
+                           f"active_employees={active_employee_ids}")
                 # Update body registry
                 if body_emp_id == final_emp_id and body_feat_idx >= 0:
-                    self.employee_registry.refresh_feature(final_emp_id, body_feat_idx, track.smooth_feat, self.frame_id)
-                    self.employee_registry.add_features(final_emp_id, track.smooth_feat, self.frame_id)
-                    self.employee_registry.prune_gallery(final_emp_id, track.smooth_feat)
+                    self.employee_registry.refresh_feature(final_emp_id, body_feat_idx, track.curr_feat, self.frame_id)
+                    self.employee_registry.add_features(final_emp_id, track.curr_feat, self.frame_id)
+                    self.employee_registry.prune_gallery(final_emp_id, track.curr_feat)
                 elif body_emp_id is None:
                     # Body didn't match, create new employee in body registry
                     self.employee_registry.add_employee(final_emp_id)
-                    self.employee_registry.add_features(final_emp_id, track.smooth_feat, self.frame_id)
+                    self.employee_registry.add_features(final_emp_id, track.curr_feat, self.frame_id)
 
                 # Update face registry
                 if face_feat is not None and face_emp_id == final_emp_id and face_feat_idx >= 0:
-                    self.face_registry.refresh_feature(final_emp_id, face_feat_idx, face_feat, self.frame_id)
-                    self.face_registry.add_features(final_emp_id, face_feat, self.frame_id)
+                    self.face_registry.refresh_feature(final_emp_id, face_feat_idx, face_feat, self.frame_id, face_pose_label)
+                    self.face_registry.add_features(final_emp_id, face_feat, self.frame_id, face_pose_label, self.video_time)
                     self.face_registry.prune_gallery(final_emp_id, face_feat)
                 elif face_feat is not None and face_emp_id is None:
                     # Face didn't match, add to face registry under final_emp_id
-                    self.face_registry.add_features(final_emp_id, face_feat, self.frame_id)
+                    self.face_registry.add_features(final_emp_id, face_feat, self.frame_id, face_pose_label, self.video_time)
 
             elif track.employee_id is not None:
                 # Track already has identity, add features to existing galleries
-                self.employee_registry.add_features(track.employee_id, track.smooth_feat, self.frame_id)
-                if face_feat is not None:
-                    self.face_registry.add_features(track.employee_id, face_feat, self.frame_id)
+                self.employee_registry.add_features(track.employee_id, track.curr_feat, self.frame_id)
+                if face_feat is not None and not track.face_pending_verify:
+                    self.face_registry.add_features(track.employee_id, face_feat, self.frame_id, face_pose_label, self.video_time)
+
+                # Face pending verification: check if face confirms or contradicts assigned identity
+                if track.face_pending_verify:
+                    if face_emp_id is not None and face_emp_id == track.employee_id:
+                        # Face confirms the body-assigned identity
+                        track.face_pending_verify = False
+                        logger.debug(f"[{self.video_time:.2f}s] FACE VERIFIED: track_id={track.track_id}, "
+                                   f"employee={track.employee_id}, face_dist={face_dist:.4f}")
+                    elif face_emp_id is not None and face_emp_id != track.employee_id:
+                        # Face contradicts body-assigned identity — trust face (more reliable)
+                        old_emp_id = track.employee_id
+                        active_employee_ids.discard(old_emp_id)
+                        if face_emp_id not in active_employee_ids:
+                            # Reassign to face-matched identity
+                            track.employee_id = face_emp_id
+                            track.face_pending_verify = False
+                            logger.debug(f"[{self.video_time:.2f}s] FACE REASSIGN: track_id={track.track_id}, "
+                                       f"old_employee={old_emp_id}, new_employee={face_emp_id}, "
+                                       f"face_dist={face_dist:.4f}")
+                            # If the old identity was minted for this track and no other track
+                            # holds it, remove it — it was a false employee
+                            if old_emp_id == getattr(track, '_created_employee_id', None):
+                                held_by_others = any(
+                                    t is not track and t.employee_id == old_emp_id
+                                    for t in self.tracked_stracks + self.lost_stracks
+                                )
+                                if not held_by_others:
+                                    self.employee_registry.remove_employee(old_emp_id)
+                                    self.employee_presence.pop(old_emp_id, None)
+                                    self.face_registry.galleries.pop(old_emp_id, None)
+                                    self.face_registry.metadata.pop(old_emp_id, None)
+                                    logger.debug(f"[{self.video_time:.2f}s] EMPLOYEE REMOVED: employee={old_emp_id}, "
+                                               f"reason=face_reassign_to={face_emp_id}, track_id={track.track_id}")
+                                track._created_employee_id = None
+                            # Add face feature to new employee's gallery
+                            self.face_registry.add_features(face_emp_id, face_feat, self.frame_id, face_pose_label, self.video_time)
+                        else:
+                            # Face-matched employee is already actively tracked elsewhere — keep old identity
+                            track.face_pending_verify = False
+                            logger.debug(f"[{self.video_time:.2f}s] FACE CONFLICT IGNORED: track_id={track.track_id}, "
+                                       f"employee={old_emp_id}, face_match={face_emp_id} (active elsewhere)")
+                    elif len(track.face_features_buffer) > 0:
+                        # Face didn't match anyone — check if assigned employee's face gallery is empty
+                        pose_galleries = self.face_registry.galleries.get(track.employee_id, {'front': [], 'left': [], 'right': []})
+                        total_face_features = sum(len(pose_galleries[p]) for p in ['front', 'left', 'right'])
+                        if total_face_features == 0:
+                            # Gallery is empty, no reference to compare against — seed with buffer face
+                            best_buf_feat = max(track.face_features_buffer, key=lambda x: x[2])
+                            buf_feat, buf_fid, buf_score, buf_pose = best_buf_feat
+                            self.face_registry.add_features(track.employee_id, buf_feat, buf_fid, buf_pose, self.video_time)
+                            track.face_pending_verify = False
+                            track.face_features_buffer = []
+                            logger.debug(f"[{self.video_time:.2f}s] FACE SEEDED: track_id={track.track_id}, "
+                                       f"employee={track.employee_id}, pose={buf_pose}, "
+                                       f"(gallery was empty, no reference to verify against)")
 
             elif final_emp_id is None:
-                # No match found, create new employee
-                new_emp_id = f"emp_{len(self.employee_registry.list_employees()) + 1:03d}"
-                self.employee_registry.add_employee(new_emp_id)
-                track.employee_id = new_emp_id
-                self.employee_registry.add_features(new_emp_id, track.smooth_feat, self.frame_id)
-                if face_feat is not None:
-                    self.face_registry.add_features(new_emp_id, face_feat, self.frame_id)
+                # No match found — check if we can create a new employee
+                # Use track_id as proxy for total tracks created (track_ids are monotonically increasing)
+                total_employees = len(self.employee_registry.list_employees())
+                if total_employees >= track.track_id:
+                    # Don't create new employee, likely false match
+                    pass
+                else:
+                    new_emp_id = f"emp_{total_employees + 1:03d}"
+                    self.employee_registry.add_employee(new_emp_id)
+                    track.employee_id = new_emp_id
+                    track._created_employee_id = new_emp_id  # For cleanup if a face later reassigns this track
+                    self.employee_registry.add_features(new_emp_id, track.curr_feat, self.frame_id)
+                    if face_feat is not None:
+                        self.face_registry.add_features(new_emp_id, face_feat, self.frame_id, face_pose_label, self.video_time)
+                        track.face_pending_verify = False
+                    else:
+                        track.face_pending_verify = True  # No face yet, needs verification later
+                    logger.debug(f"[{self.video_time:.2f}s] NEW EMPLOYEE: track_id={track.track_id}, "
+                               f"employee={new_emp_id}, "
+                               f"body_match={body_emp_id}, body_dist={body_dist:.4f}, "
+                               f"body_all(emp,adj,bonus)={[(e, f'{d:.4f}', f'{b:.3f}') for e, d, b in body_all_distances]}, "
+                               f"face_match={face_emp_id}, face_dist={face_dist:.4f}, "
+                               f"face_all={[(e, f'{d:.4f}') for e, d in face_all_distances]}, "
+                               f"face_score={face_score:.2f}, face_buffer={len(track.face_features_buffer)}, "
+                               f"registry_size={total_employees + 1}, "
+                               f"active_employees={active_employee_ids}")
 
             # Clear face buffer after identity assignment
             if track.employee_id is not None:
                 track.face_features_buffer = []
-
-            # Logging removed to reduce output
 
     def _cascade_verification(
         self, track, body_emp_id, body_dist, body_feat_idx,
@@ -759,6 +918,119 @@ class BoTSORT(object):
             return face_emp_id
         else:
             return None
+
+    def _remove_lost_tracks_holding(self, employee_id, keeper_track):
+        """
+        One employee, one track: remove lost tracks still holding this identity.
+        Their detections will be treated as new tracks from now on.
+        """
+        losers = [t for t in self.lost_stracks
+                  if t is not keeper_track and t.employee_id == employee_id]
+        if not losers:
+            return
+
+        for t in losers:
+            t.mark_removed()
+            self.removed_stracks.append(t)
+            logger.debug(f"[{self.video_time:.2f}s] TRACK REMOVED: track_id={t.track_id}, employee_id={t.employee_id}, "
+                       f"lost_frames={self.frame_id - t.end_frame}, reason=identity_taken_by_track={keeper_track.track_id}")
+
+        self.lost_stracks = [t for t in self.lost_stracks if t.state != TrackState.Removed]
+
+    def _verify_reactivated_identity(self, track, old_smooth_feat):
+        """
+        Verify identity after track re-activation.
+        Uses curr_feat (current frame) against old smooth_feat and employee gallery.
+        If verification fails, clears identity and tries to re-match from lost employees.
+        """
+        if not self.with_employee_registry or track.employee_id is None:
+            return
+
+        old_emp_id = track.employee_id
+
+        if track.curr_feat is None or old_smooth_feat is None:
+            return
+
+        verify_thresh = self.employee_registry.config.REID_VERIFY_THRESHOLD
+        verify_thresh_b = self.employee_registry.config.REID_VERIFY_THRESHOLD_B
+
+        # Check A: curr_feat vs old smooth_feat (before re_activate updated it)
+        old_smooth_norm = old_smooth_feat / (np.linalg.norm(old_smooth_feat) + 1e-8)
+        curr_norm = track.curr_feat / (np.linalg.norm(track.curr_feat) + 1e-8)
+        feat_change_dist = 1.0 - np.dot(curr_norm, old_smooth_norm)
+
+        # Check B: curr_feat vs employee gallery
+        min_gallery_dist = float('inf')
+        gallery = self.employee_registry.galleries.get(old_emp_id, [])
+        if len(gallery) >= self.employee_registry.config.MIN_GALLERY_SIZE:
+            gallery_features = np.stack([g[0] for g in gallery])
+            distances = self.employee_registry._cosine_distance(track.curr_feat, gallery_features)
+            min_gallery_dist = float(np.min(distances))
+
+        check_a_fail = feat_change_dist > verify_thresh
+        check_b_fail = min_gallery_dist > verify_thresh_b
+
+        logger.debug(f"[{self.video_time:.2f}s] VERIFY CHECK: track_id={track.track_id}, employee={old_emp_id}, "
+                   f"checkA_dist={feat_change_dist:.4f}({'FAIL' if check_a_fail else 'OK'}), "
+                   f"checkB_dist={min_gallery_dist:.4f}({'FAIL' if check_b_fail else 'OK'}), "
+                   f"thresh=({verify_thresh}, {verify_thresh_b})")
+
+        if not check_a_fail and not check_b_fail:
+            # Identity confirmed — remove any lost track still holding it, so
+            # the same person's next detection becomes a new track instead of
+            # a second holder of this employee
+            self._remove_lost_tracks_holding(old_emp_id, track)
+
+            # Body checks passed, but re-activation is high-risk — require face
+            # confirmation on subsequent frames before trusting the identity again
+            track.face_pending_verify = True
+            logger.debug(f"[{self.video_time:.2f}s] FACE PENDING AFTER RE-ACTIVATION: track_id={track.track_id}, "
+                       f"employee={old_emp_id}, body checks passed, awaiting face verification")
+            return
+
+        # Identity verification failed — try to re-match from lost employees
+        old_emp_id_backup = track.employee_id
+        track._previous_employee_id = old_emp_id_backup  # Save for re-matching
+        track.employee_id = None
+        active_employee_ids = {t.employee_id for t in self.tracked_stracks
+                              if t.employee_id is not None}
+
+        all_distances = []
+        for emp_id_iter, emp_gallery in self.employee_registry.galleries.items():
+            if emp_id_iter in active_employee_ids:
+                continue
+            if len(emp_gallery) < self.employee_registry.config.MIN_GALLERY_SIZE:
+                continue
+            g_features = np.stack([g[0] for g in emp_gallery])
+            g_distances = self.employee_registry._cosine_distance(track.curr_feat, g_features)
+            all_distances.append((emp_id_iter, float(np.min(g_distances))))
+        all_distances.sort(key=lambda x: x[1])
+
+        emp_id, dist, feat_idx = self.employee_registry.identify(
+            track.curr_feat, exclude_ids=active_employee_ids, current_frame=self.frame_id
+        )
+
+        logger.debug(f"[{self.video_time:.2f}s] VERIFY REGISTRY CHECK: track_id={track.track_id}, "
+                   f"old_emp={old_emp_id}, matched={emp_id}, distance={dist:.4f}, "
+                   f"all_distances={[(e, f'{d:.4f}') for e, d in all_distances]}, "
+                   f"registry_size={len(self.employee_registry.list_employees())}, "
+                   f"active_employees={active_employee_ids}")
+
+        if emp_id is not None:
+            track.employee_id = emp_id
+            track.face_pending_verify = True  # Body-only re-match, needs face verification
+            self._remove_lost_tracks_holding(emp_id, track)
+            self.employee_registry.refresh_feature(emp_id, feat_idx, track.curr_feat, self.frame_id)
+            self.employee_registry.prune_gallery(emp_id, track.curr_feat)
+        else:
+            # No match found — mark as gray, wait for stable re-match
+            # Don't create new employee immediately, let _collect_features_to_registry handle it
+            # after a few frames with fresh features
+            track.stable_count = 0
+            track.face_features_buffer = []
+            track.face_pending_verify = False
+            logger.debug(f"[{self.video_time:.2f}s] VERIFY FAILED, MARKED GRAY: track_id={track.track_id}, "
+                       f"old_employee={old_emp_id}, will retry after stabilization")
 
 
 def joint_stracks(tlista, tlistb):

@@ -27,6 +27,7 @@ class EmployeeRegistry:
         self.config = config or EmployeeRegistryConfig()
         self.galleries: Dict[str, List[Tuple[np.ndarray, int]]] = defaultdict(list)
         self.metadata: Dict[str, Dict] = {}
+        self.last_positions: Dict[str, Tuple[float, float, int]] = {}
 
     def add_employee(self, employee_id: str, name: str = "") -> None:
         if employee_id in self.galleries:
@@ -59,21 +60,65 @@ class EmployeeRegistry:
         added_count = 0
 
         for feat in features:
-            if self._is_duplicate(employee_id, feat):
-                continue
+            gallery = self.galleries[employee_id]
 
-            self.galleries[employee_id].append((feat, frame_id))
+            # Dedup: if a similar feature exists, refresh its timestamp instead of adding
+            if len(gallery) > 0:
+                gallery_features = np.stack([g[0] for g in gallery])
+                distances = self._cosine_distance(feat, gallery_features)
+                min_idx = int(np.argmin(distances))
+                if 1.0 - float(distances[min_idx]) > self.config.DEDUP_SIMILARITY_THRESHOLD:
+                    gallery[min_idx] = (gallery[min_idx][0], frame_id)
+                    continue
+
+            gallery.append((feat, frame_id))
             added_count += 1
 
-            if len(self.galleries[employee_id]) > self.config.MAX_GALLERY_SIZE:
-                self.galleries[employee_id].pop(0)
+            if len(gallery) > self.config.MAX_GALLERY_SIZE:
+                gallery.pop(0)
 
         if added_count > 0:
             self.metadata[employee_id]["feature_count"] = len(self.galleries[employee_id])
 
         return added_count
 
-    def identify(self, feature: np.ndarray, exclude_ids: Optional[set] = None, current_frame: int = 0) -> Tuple[Optional[str], float, int]:
+    @staticmethod
+    def foot_point(tlbr) -> Tuple[float, float]:
+        """Bottom-center of a tlbr box — the person's ground contact point."""
+        return ((float(tlbr[0]) + float(tlbr[2])) / 2.0, float(tlbr[3]))
+
+    def update_position(self, employee_id: str, foot_xy: Tuple[float, float], frame_id: int) -> None:
+        """Record the employee's latest foot point and the frame it was seen at."""
+        self.last_positions[employee_id] = (float(foot_xy[0]), float(foot_xy[1]), int(frame_id))
+
+    def position_bonus(self, employee_id: str, query_pos: Optional[Tuple[float, float]],
+                       query_frame: Optional[int] = None) -> float:
+        """Position term subtracted from the distance: positive discounts near candidates, negative penalizes far ones.
+
+        The radius scales with the employee's absence — it is the distance they could
+        have walked since last seen: R = clamp(POSITION_SPEED * (query_frame - last_seen), MIN, MAX).
+
+        d <= R:      +POSITION_BONUS * (1 - d / R)
+        R < d < 2R:  -POSITION_PENALTY * (d - R) / R
+        d >= 2R:     -POSITION_PENALTY
+        """
+        if query_pos is None or query_frame is None or employee_id not in self.last_positions:
+            return 0.0
+
+        last_x, last_y, last_frame = self.last_positions[employee_id]
+        absent = max(0, int(query_frame) - last_frame)
+        radius = min(max(self.config.POSITION_SPEED * absent,
+                         self.config.POSITION_RADIUS_MIN),
+                     self.config.POSITION_RADIUS_MAX)
+        dist = float(np.hypot(last_x - query_pos[0], last_y - query_pos[1]))
+        if dist <= radius:
+            return self.config.POSITION_BONUS * (1.0 - dist / radius)
+        ramp = min(1.0, (dist - radius) / radius)
+        return -self.config.POSITION_PENALTY * ramp
+
+    def identify(self, feature: np.ndarray, exclude_ids: Optional[set] = None, current_frame: int = 0,
+                 query_pos: Optional[Tuple[float, float]] = None,
+                 query_frame: Optional[int] = None) -> Tuple[Optional[str], float, int]:
         """
         Match a feature against all employee galleries with time weighting.
 
@@ -81,12 +126,19 @@ class EmployeeRegistry:
             feature: Feature vector of shape (2048,)
             exclude_ids: Optional set of employee_ids to skip (e.g., those with active tracks)
             current_frame: Current frame number for time weighting
+            query_pos: Optional foot point of the query track; candidates last seen near
+                it get a distance discount, far ones a penalty (subtracted from distance)
+            query_frame: Optional frame at which query_pos was observed (defaults to current_frame);
+                drives the absence-scaled radius of the position term
 
         Returns:
             Tuple of (employee_id, weighted_distance, best_feature_index) or (None, inf, -1) if no match
         """
         if feature.ndim != 1:
             feature = feature.flatten()
+
+        if query_frame is None:
+            query_frame = current_frame
 
         best_id = None
         best_dist = float('inf')
@@ -104,8 +156,8 @@ class EmployeeRegistry:
             distances = self._cosine_distance(feature, gallery_features)
 
             age = current_frame - gallery_frames
-            time_weights = np.exp(-self.config.TIME_WEIGHT_DECAY * age)
-            weighted_distances = distances / time_weights
+            time_weights = np.maximum(np.exp(-self.config.TIME_WEIGHT_DECAY * age), self.config.MIN_TIME_WEIGHT)
+            weighted_distances = distances / time_weights - self.position_bonus(employee_id, query_pos, query_frame)
 
             min_idx = np.argmin(weighted_distances)
             min_dist = weighted_distances[min_idx]
@@ -130,6 +182,12 @@ class EmployeeRegistry:
         if employee_id in self.galleries:
             self.galleries[employee_id] = []
             self.metadata[employee_id]["feature_count"] = 0
+
+    def remove_employee(self, employee_id: str) -> None:
+        """Remove an employee entirely — gallery, metadata and position record."""
+        self.galleries.pop(employee_id, None)
+        self.metadata.pop(employee_id, None)
+        self.last_positions.pop(employee_id, None)
 
     def refresh_feature(self, employee_id: str, feature_idx: int, new_feature: np.ndarray, frame_id: int) -> None:
         """Update a matched feature's vector and refresh its timestamp."""
@@ -162,17 +220,6 @@ class EmployeeRegistry:
             self.metadata[employee_id]["feature_count"] = len(kept)
 
         return removed
-
-    def _is_duplicate(self, employee_id: str, feature: np.ndarray) -> bool:
-        if len(self.galleries[employee_id]) == 0:
-            return False
-
-        gallery_features = np.stack([g[0] for g in self.galleries[employee_id]])
-        distances = self._cosine_distance(feature, gallery_features)
-        min_dist = np.min(distances)
-
-        similarity = 1 - min_dist
-        return similarity > self.config.DEDUP_SIMILARITY_THRESHOLD
 
     def _cosine_distance(self, a: np.ndarray, b: np.ndarray) -> np.ndarray:
         a_norm = a / (np.linalg.norm(a) + 1e-8)

@@ -32,23 +32,72 @@ class FaceAnalysisWrapper:
         """Initialize insightface FaceAnalysis model."""
         try:
             from insightface.app import FaceAnalysis
-            self.app = FaceAnalysis(name='buffalo_s', providers=self.config.PROVIDERS)
+            self.app = FaceAnalysis(name='buffalo_l', providers=self.config.PROVIDERS)
             self.app.prepare(ctx_id=0, det_size=self.config.DET_SIZE, det_thresh=self.config.DET_SCORE)
-            logger.info("FaceAnalysis model loaded successfully")
+            logger.info("FaceAnalysis model loaded successfully (buffalo_l)")
         except Exception as e:
             logger.error(f"Failed to load FaceAnalysis model: {e}")
             self.app = None
 
-    def extract_face(self, img: np.ndarray, person_bbox: np.ndarray) -> Optional[Tuple[np.ndarray, float]]:
+    def _calculate_yaw_angle(self, landmark: np.ndarray) -> float:
+        """
+        通过人脸关键点计算yaw角度（水平旋转）。
+        只负责计算原始角度，分类由 _classify_pose 根据配置阈值判断。
+
+        Args:
+            landmark: 5个关键点 [[左眼x,左眼y], [右眼x,右眼y], [鼻尖x,鼻尖y], [左嘴角x,左嘴角y], [右嘴角x,右嘴角y]]
+
+        Returns:
+            yaw角度（度）：正=右转，负=左转，0=正脸
+        """
+        left_eye = landmark[0]
+        right_eye = landmark[1]
+        nose = landmark[2]
+
+        eye_center = (left_eye + right_eye) / 2
+        eye_distance = np.linalg.norm(right_eye - left_eye)
+        if eye_distance < 1e-6:
+            return 0.0
+
+        nose_offset = nose[0] - eye_center[0]
+        offset_ratio = nose_offset / eye_distance
+        offset_ratio = np.clip(offset_ratio, -0.99, 0.99)
+        yaw_angle = np.degrees(np.arcsin(offset_ratio))
+
+        return yaw_angle
+
+    def _classify_pose(self, yaw_angle: float) -> str:
+        """
+        根据yaw角度分类人脸姿态。
+
+        Returns:
+            'front' | 'left' | 'right' | 'unknown'
+            - |yaw| <= FRONT_MAX_YAW → front
+            - FRONT_MAX_YAW < |yaw| < MAX_YAW → left/right
+            - |yaw| >= MAX_YAW → unknown (拒绝)
+        """
+        abs_yaw = abs(yaw_angle)
+        if abs_yaw <= self.config.FRONT_MAX_YAW:
+            return 'front'
+        elif abs_yaw >= self.config.MAX_YAW:
+            return 'unknown'
+        elif yaw_angle < 0:
+            return 'left'
+        else:
+            return 'right'
+
+    def extract_face(self, img: np.ndarray, person_bbox: np.ndarray, video_time: float = 0.0) -> Optional[Tuple[np.ndarray, float, str, float]]:
         """
         Detect face within person bbox and extract face feature.
 
         Args:
             img: Original image (BGR format)
             person_bbox: Person bounding box [x1, y1, x2, y2]
+            video_time: Current video timestamp in seconds (for logging)
 
         Returns:
-            (face_feature, quality_score) or None if no valid face found
+            (face_feature, quality_score, pose_label, yaw_angle) or None if no valid face found
+            pose_label: 'front' | 'left' | 'right'
         """
         if self.app is None:
             return None
@@ -97,10 +146,20 @@ class FaceAnalysisWrapper:
         if det_score < self.config.MIN_DETECTION_SCORE:
             return None
 
-        # Get face feature (128-dim, already normalized by insightface)
+        # Calculate yaw angle and classify pose (use 5-point landmarks: left_eye, right_eye, nose, left_mouth, right_mouth)
+        yaw_angle = self._calculate_yaw_angle(face.kps)
+        pose_label = self._classify_pose(yaw_angle)
+
+        # Skip unknown pose (yaw exceeds MAX_YAW)
+        if pose_label == 'unknown':
+            return None
+
+        # Get face feature (512-dim for buffalo_l, L2-normalized by insightface)
         face_feat = face.embedding
 
-        return face_feat, float(det_score)
+        logger.debug(f"[{video_time:.2f}s] FACE EXTRACTED: face_size=({face_w:.0f}x{face_h:.0f}), "
+                   f"det_score={det_score:.3f}, pose={pose_label}, yaw={yaw_angle:.1f}°")
+        return face_feat, float(det_score), pose_label, float(yaw_angle)
 
     def is_available(self) -> bool:
         """Check if face analysis model is loaded."""
