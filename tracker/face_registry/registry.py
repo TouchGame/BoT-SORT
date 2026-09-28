@@ -105,7 +105,7 @@ class FaceRegistry:
 
         return added_count
 
-    def identify(self, feature: np.ndarray, exclude_ids: Optional[set] = None, current_frame: int = 0, return_all: bool = False) -> Tuple[Optional[str], float, int, Optional[List[Tuple[str, float]]]]:
+    def identify(self, feature: np.ndarray, exclude_ids: Optional[set] = None, current_frame: int = 0, return_all: bool = False, face_size: Optional[float] = None) -> Tuple[Optional[str], float, int, Optional[List[Tuple[str, float]]]]:
         """
         Match a face feature against all employee galleries (all pose slots).
 
@@ -114,6 +114,7 @@ class FaceRegistry:
             exclude_ids: Optional set of employee_ids to skip
             current_frame: Current frame number for time weighting
             return_all: If True, also return distances to all employees
+            face_size: Detected face min side in pixels; small faces use a relaxed threshold
 
         Returns:
             Tuple of (employee_id, weighted_distance, best_feature_index) or (None, inf, -1)
@@ -161,25 +162,27 @@ class FaceRegistry:
 
         all_distances.sort(key=lambda x: x[1])
 
-        if best_dist < self.config.MATCH_THRESHOLD:
+        match_threshold = self._match_threshold(face_size)
+
+        if best_dist < match_threshold:
             if return_all:
                 return best_id, best_dist, best_idx, all_distances
             return best_id, best_dist, best_idx
 
-        logger.debug(f"FACE NO MATCH: best_dist={best_dist:.4f} >= threshold={self.config.MATCH_THRESHOLD}, "
+        logger.debug(f"FACE NO MATCH: best_dist={best_dist:.4f} >= threshold={match_threshold}, "
                    f"best_id={best_id}, all_distances={[(e, f'{d:.4f}') for e, d in all_distances]}")
 
         if return_all:
             return None, best_dist, -1, all_distances
         return None, best_dist, -1
 
-    def identify_best_match(self, face_buffer: List[Tuple[np.ndarray, int, float, str]], exclude_ids: Optional[set] = None, current_frame: int = 0) -> Tuple[Optional[str], float, int, Optional[np.ndarray], List[Tuple[str, float]]]:
+    def identify_best_match(self, face_buffer: List[Tuple[np.ndarray, int, float, str, float]], exclude_ids: Optional[set] = None, current_frame: int = 0) -> Tuple[Optional[str], float, int, Optional[np.ndarray], List[Tuple[str, float]]]:
         """
         Match multiple face features against all employee galleries.
         Returns the best match across all buffered features.
 
         Args:
-            face_buffer: List of (feature, frame_id, quality_score, pose_label) tuples
+            face_buffer: List of (feature, frame_id, quality_score, pose_label, face_size) tuples
             exclude_ids: Optional set of employee_ids to skip
             current_frame: Current frame number for time weighting
 
@@ -198,13 +201,17 @@ class FaceRegistry:
         best_face_by_quality = max(face_buffer, key=lambda x: x[2])[0]
         all_distances_dict = {}  # {emp_id: min_dist}
 
-        for face_feat, frame_id, quality_score, pose_label in face_buffer:
-            emp_id, dist, idx, emp_distances = self.identify(face_feat, exclude_ids, current_frame, return_all=True)
+        for face_feat, frame_id, quality_score, pose_label, face_size in face_buffer:
+            emp_id, dist, idx, emp_distances = self.identify(face_feat, exclude_ids, current_frame, return_all=True, face_size=face_size)
             # Update all_distances with minimum distance per employee
             for e, d in emp_distances:
                 if e not in all_distances_dict or d < all_distances_dict[e]:
                     all_distances_dict[e] = d
-            if dist < best_dist:
+            # Prefer real matches over smaller raw distances: with per-size
+            # thresholds a non-matching entry can be closer than a matching one
+            is_match = emp_id is not None
+            was_match = best_id is not None
+            if (is_match and not was_match) or (is_match == was_match and dist < best_dist):
                 best_dist = dist
                 best_id = emp_id
                 best_idx = idx
@@ -272,6 +279,12 @@ class FaceRegistry:
             self.metadata[employee_id]["feature_count"] = total_count
 
         return total_removed
+
+    def _match_threshold(self, face_size: Optional[float]) -> float:
+        """Small faces have noisier features, so they get a relaxed threshold."""
+        if face_size is not None and face_size < self.config.SMALL_FACE_SIZE:
+            return self.config.SMALL_FACE_MATCH_THRESHOLD
+        return self.config.MATCH_THRESHOLD
 
     def _cosine_distance(self, a: np.ndarray, b: np.ndarray) -> np.ndarray:
         a_norm = a / (np.linalg.norm(a) + 1e-8)

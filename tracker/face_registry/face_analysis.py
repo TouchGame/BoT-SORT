@@ -86,7 +86,7 @@ class FaceAnalysisWrapper:
         else:
             return 'right'
 
-    def extract_face(self, img: np.ndarray, person_bbox: np.ndarray, video_time: float = 0.0) -> Optional[Tuple[np.ndarray, float, str, float]]:
+    def extract_face(self, img: np.ndarray, person_bbox: np.ndarray, video_time: float = 0.0) -> Optional[Tuple[np.ndarray, float, str, float, float]]:
         """
         Detect face within person bbox and extract face feature.
 
@@ -96,8 +96,9 @@ class FaceAnalysisWrapper:
             video_time: Current video timestamp in seconds (for logging)
 
         Returns:
-            (face_feature, quality_score, pose_label, yaw_angle) or None if no valid face found
+            (face_feature, quality_score, pose_label, yaw_angle, face_size) or None if no valid face found
             pose_label: 'front' | 'left' | 'right'
+            face_size: min(face_w, face_h) in pixels
         """
         if self.app is None:
             return None
@@ -159,7 +160,7 @@ class FaceAnalysisWrapper:
 
         logger.debug(f"[{video_time:.2f}s] FACE EXTRACTED: face_size=({face_w:.0f}x{face_h:.0f}), "
                    f"det_score={det_score:.3f}, pose={pose_label}, yaw={yaw_angle:.1f}°")
-        return face_feat, float(det_score), pose_label, float(yaw_angle)
+        return face_feat, float(det_score), pose_label, float(yaw_angle), float(min(face_w, face_h))
 
     def is_available(self) -> bool:
         """Check if face analysis model is loaded."""

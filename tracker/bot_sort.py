@@ -21,6 +21,42 @@ logging.basicConfig(
 )
 logger = logging.getLogger('bot_sort')
 
+# Occlusion gating: boxes covered by nearer boxes beyond the configured ratio
+# get no employee-gallery writes for that frame.
+OCCLUSION_BOTTOM_MARGIN_RATIO = 0.03  # Bottom-edge difference below this is "same depth"
+OCCLUSION_AREA_MARGIN_RATIO = 0.10    # Same-depth fallback: nearer box must be 10% larger
+
+
+def _occlusion_ratio(box, other_boxes):
+    """Fraction of `box` (xyxy) covered by boxes judged nearer.
+
+    A box is nearer when its bottom edge projects lower in the image (ground-plane
+    depth cue); same-depth overlaps only count for a clearly larger box. Multiple
+    occluders sum up, capped at 1.0.
+    """
+    x1, y1, x2, y2 = box[:4]
+    w, h = x2 - x1, y2 - y1
+    if w <= 0 or h <= 0:
+        return 0.0
+    area = w * h
+    bottom_margin = OCCLUSION_BOTTOM_MARGIN_RATIO * h
+    covered = 0.0
+    for ob in other_boxes:
+        ox1, oy1, ox2, oy2 = ob[:4]
+        ix1, iy1 = max(x1, ox1), max(y1, oy1)
+        ix2, iy2 = min(x2, ox2), min(y2, oy2)
+        if ix2 <= ix1 or iy2 <= iy1:
+            continue
+        if oy2 - y2 > bottom_margin:
+            nearer = True
+        elif oy2 - y2 >= -bottom_margin:
+            nearer = (ox2 - ox1) * (oy2 - oy1) > area * (1.0 + OCCLUSION_AREA_MARGIN_RATIO)
+        else:
+            nearer = False
+        if nearer:
+            covered += (ix2 - ix1) * (iy2 - iy1)
+    return min(covered / area, 1.0)
+
 
 class STrack(BaseTrack):
     shared_kalman = KalmanFilter()
@@ -38,6 +74,9 @@ class STrack(BaseTrack):
 
         self.smooth_feat = None
         self.curr_feat = None
+        # EMA since the last (re)activation; stable identity re-checks query with this so a
+        # re-found track is never matched on the appearance of a suspected earlier identity
+        self.stable_smooth_feat = None
         if feat is not None:
             self.update_features(feat)
         self.features = deque([], maxlen=feat_history)
@@ -48,9 +87,10 @@ class STrack(BaseTrack):
         self.birth_pos = None  # Foot point at track birth; anchors the position bonus at stable re-check
         self.stable_count = 0
         self.face_pending_verify = False  # True when identity was assigned body-only, awaiting face confirmation
+        self.occluded = False  # True when this frame's matched detection is judged heavily occluded
 
         # Face feature buffer: accumulate face features before identity assignment
-        self.face_features_buffer = []  # [(feature, frame_id, quality_score, pose_label), ...]
+        self.face_features_buffer = []  # [(feature, frame_id, quality_score, pose_label, face_size), ...]
 
     def update_features(self, feat):
         feat /= np.linalg.norm(feat)
@@ -61,6 +101,12 @@ class STrack(BaseTrack):
             self.smooth_feat = self.alpha * self.smooth_feat + (1 - self.alpha) * feat
         self.features.append(feat)
         self.smooth_feat /= np.linalg.norm(self.smooth_feat)
+
+        if self.stable_smooth_feat is None:
+            self.stable_smooth_feat = feat
+        else:
+            self.stable_smooth_feat = self.alpha * self.stable_smooth_feat + (1 - self.alpha) * feat
+        self.stable_smooth_feat /= np.linalg.norm(self.stable_smooth_feat)
 
     def predict(self):
         mean_state = self.mean.copy()
@@ -119,6 +165,9 @@ class STrack(BaseTrack):
     def re_activate(self, new_track, frame_id, new_id=False):
 
         self.mean, self.covariance = self.kalman_filter.update(self.mean, self.covariance, self.tlwh_to_xywh(new_track.tlwh))
+        # Restart the window here: everything before this re-detection belongs to a possibly
+        # mis-assigned identity, so the stable re-check must only see post-reactivation frames
+        self.stable_smooth_feat = None
         if new_track.curr_feat is not None:
             self.update_features(new_track.curr_feat)
         self.tracklet_len = 0
@@ -128,6 +177,7 @@ class STrack(BaseTrack):
         if new_id:
             self.track_id = self.next_id()
         self.score = new_track.score
+        self.occluded = new_track.occluded
 
     def update(self, new_track, frame_id):
         """
@@ -152,6 +202,7 @@ class STrack(BaseTrack):
         self.is_activated = True
 
         self.score = new_track.score
+        self.occluded = new_track.occluded
 
     @property
     def tlwh(self):
@@ -255,6 +306,7 @@ class BoTSORT(object):
         if self.with_employee_registry:
             self.employee_registry = EmployeeRegistry()
             self.min_track_length = self.employee_registry.config.MIN_TRACK_LENGTH
+            self.max_occlusion_ratio = self.employee_registry.config.MAX_OCCLUSION_RATIO
             self.employee_presence = {}  # {employee_id: last_frame_seen}
         else:
             self.employee_registry = None
@@ -327,6 +379,9 @@ class BoTSORT(object):
             else:
                 detections = [STrack(STrack.tlbr_to_tlwh(tlbr), s) for
                               (tlbr, s) in zip(dets, scores_keep)]
+            if self.with_employee_registry:
+                for det in detections:
+                    det.occluded = bool(_occlusion_ratio(det.tlbr, bboxes) > self.max_occlusion_ratio)
         else:
             detections = []
 
@@ -509,14 +564,15 @@ class BoTSORT(object):
                     person_bbox = track.tlbr
                     face_result = self.face_analysis.extract_face(self._current_img, person_bbox, self.video_time)
                     if face_result is not None:
-                        face_feat, face_score, face_pose_label, face_yaw = face_result
+                        face_feat, face_score, face_pose_label, face_yaw, face_size = face_result
                         # Add to buffer for later use if not matched immediately
-                        track.face_features_buffer.append((face_feat, self.frame_id, face_score, face_pose_label))
+                        track.face_features_buffer.append((face_feat, self.frame_id, face_score, face_pose_label, face_size))
                         logger.debug(f"[{self.video_time:.2f}s] FACE BUFFERED: track_id={track.track_id}, "
                                    f"pose={face_pose_label}, score={face_score:.2f}, "
                                    f"buffer_size={len(track.face_features_buffer)}, frame={self.frame_id}")
                         face_emp_id, face_dist, face_feat_idx, face_all_distances = self.face_registry.identify(
-                            face_feat, exclude_ids=active_employee_ids, current_frame=self.frame_id, return_all=True
+                            face_feat, exclude_ids=active_employee_ids, current_frame=self.frame_id, return_all=True,
+                            face_size=face_size
                         )
                         # If face matches, prefer face identity
                         if face_emp_id is not None:
@@ -537,8 +593,9 @@ class BoTSORT(object):
                         track.face_pending_verify = False  # Face confirmed
                     else:
                         track.face_pending_verify = True  # Body-only, needs face verification
-                    self.employee_registry.refresh_feature(emp_id, feat_idx, track.curr_feat, self.frame_id)
-                    pruned = self.employee_registry.prune_gallery(emp_id, track.curr_feat)
+                    if not track.occluded:
+                        self.employee_registry.refresh_feature(emp_id, feat_idx, track.curr_feat, self.frame_id)
+                        pruned = self.employee_registry.prune_gallery(emp_id, track.curr_feat)
                     # Update face registry if face was detected
                     if face_emp_id is not None and len(track.face_features_buffer) > 0:
                         best_face_feat = track.face_features_buffer[0][0]
@@ -628,7 +685,7 @@ class BoTSORT(object):
             if face_result is None:
                 continue
 
-            face_feat, face_score, face_pose_label, face_yaw = face_result
+            face_feat, face_score, face_pose_label, face_yaw, face_size = face_result
 
             if track.employee_id is not None and not track.face_pending_verify:
                 # Track has identity (already verified) - add directly to gallery
@@ -637,7 +694,7 @@ class BoTSORT(object):
                 # Track without identity OR pending face verification - store in buffer for matching
                 # Deduplication: skip if too similar to existing buffered features
                 is_duplicate = False
-                for existing_feat, _, _, _ in track.face_features_buffer:
+                for existing_feat, _, _, _, _ in track.face_features_buffer:
                     similarity = np.dot(face_feat, existing_feat) / (np.linalg.norm(face_feat) * np.linalg.norm(existing_feat) + 1e-8)
                     if similarity > 0.85:
                         is_duplicate = True
@@ -647,7 +704,7 @@ class BoTSORT(object):
                     continue
 
                 # Add to buffer
-                track.face_features_buffer.append((face_feat, self.frame_id, face_score, face_pose_label))
+                track.face_features_buffer.append((face_feat, self.frame_id, face_score, face_pose_label, face_size))
                 logger.debug(f"[{self.video_time:.2f}s] FACE BUFFERED: track_id={track.track_id}, "
                            f"pose={face_pose_label}, score={face_score:.2f}, "
                            f"buffer_size={len(track.face_features_buffer)}, frame={self.frame_id}")
@@ -696,6 +753,9 @@ class BoTSORT(object):
             body_emp_id, body_dist, body_feat_idx = None, float('inf'), -1
             if track.employee_id is None:
                 # Try to identify via body feature (use the birth-time position, not the moved box)
+                # Query with the windowed feature (since last re-activation) so a re-found track
+                # is not matched on the appearance of its earlier, possibly wrong identity
+                query_feat = track.stable_smooth_feat if track.stable_smooth_feat is not None else track.smooth_feat
                 query_pos = track.birth_pos if track.birth_pos is not None else self.employee_registry.foot_point(track.tlbr)
                 all_distances = []
                 for emp_id, gallery in self.employee_registry.galleries.items():
@@ -705,7 +765,7 @@ class BoTSORT(object):
                         continue
                     gallery_features = np.stack([g[0] for g in gallery])
                     gallery_frames = np.array([g[1] for g in gallery])
-                    distances = self.employee_registry._cosine_distance(track.smooth_feat, gallery_features)
+                    distances = self.employee_registry._cosine_distance(query_feat, gallery_features)
                     age = self.frame_id - gallery_frames
                     time_weights = np.maximum(np.exp(-self.employee_registry.config.TIME_WEIGHT_DECAY * age),
                                               self.employee_registry.config.MIN_TIME_WEIGHT)
@@ -715,7 +775,7 @@ class BoTSORT(object):
                     all_distances.append((emp_id, min_dist - bonus, bonus))
 
                 body_emp_id, body_dist, body_feat_idx = self.employee_registry.identify(
-                    track.smooth_feat, exclude_ids=active_employee_ids, current_frame=self.frame_id, query_pos=query_pos,
+                    query_feat, exclude_ids=active_employee_ids, current_frame=self.frame_id, query_pos=query_pos,
                     query_frame=track.start_frame
                 )
                 all_distances.sort(key=lambda x: x[1])
@@ -739,7 +799,7 @@ class BoTSORT(object):
                 )
                 if face_feat is not None:
                     # Get quality score and pose label of best face
-                    for buf_feat, buf_fid, buf_score, buf_pose in track.face_features_buffer:
+                    for buf_feat, buf_fid, buf_score, buf_pose, _ in track.face_features_buffer:
                         if np.array_equal(buf_feat, face_feat):
                             face_score = buf_score
                             face_pose_label = buf_pose
@@ -778,13 +838,15 @@ class BoTSORT(object):
                            f"active_employees={active_employee_ids}")
                 # Update body registry
                 if body_emp_id == final_emp_id and body_feat_idx >= 0:
-                    self.employee_registry.refresh_feature(final_emp_id, body_feat_idx, track.curr_feat, self.frame_id)
-                    self.employee_registry.add_features(final_emp_id, track.curr_feat, self.frame_id)
-                    self.employee_registry.prune_gallery(final_emp_id, track.curr_feat)
+                    if not track.occluded:
+                        self.employee_registry.refresh_feature(final_emp_id, body_feat_idx, track.curr_feat, self.frame_id)
+                        self.employee_registry.add_features(final_emp_id, track.curr_feat, self.frame_id)
+                        self.employee_registry.prune_gallery(final_emp_id, track.curr_feat)
                 elif body_emp_id is None:
                     # Body didn't match, create new employee in body registry
                     self.employee_registry.add_employee(final_emp_id)
-                    self.employee_registry.add_features(final_emp_id, track.curr_feat, self.frame_id)
+                    if not track.occluded:
+                        self.employee_registry.add_features(final_emp_id, track.curr_feat, self.frame_id)
 
                 # Update face registry
                 if face_feat is not None and face_emp_id == final_emp_id and face_feat_idx >= 0:
@@ -797,7 +859,8 @@ class BoTSORT(object):
 
             elif track.employee_id is not None:
                 # Track already has identity, add features to existing galleries
-                self.employee_registry.add_features(track.employee_id, track.curr_feat, self.frame_id)
+                if not track.occluded:
+                    self.employee_registry.add_features(track.employee_id, track.curr_feat, self.frame_id)
                 if face_feat is not None and not track.face_pending_verify:
                     self.face_registry.add_features(track.employee_id, face_feat, self.frame_id, face_pose_label, self.video_time)
 
@@ -848,7 +911,7 @@ class BoTSORT(object):
                         if total_face_features == 0:
                             # Gallery is empty, no reference to compare against — seed with buffer face
                             best_buf_feat = max(track.face_features_buffer, key=lambda x: x[2])
-                            buf_feat, buf_fid, buf_score, buf_pose = best_buf_feat
+                            buf_feat, buf_fid, buf_score, buf_pose, _ = best_buf_feat
                             self.face_registry.add_features(track.employee_id, buf_feat, buf_fid, buf_pose, self.video_time)
                             track.face_pending_verify = False
                             track.face_features_buffer = []
@@ -868,7 +931,8 @@ class BoTSORT(object):
                     self.employee_registry.add_employee(new_emp_id)
                     track.employee_id = new_emp_id
                     track._created_employee_id = new_emp_id  # For cleanup if a face later reassigns this track
-                    self.employee_registry.add_features(new_emp_id, track.curr_feat, self.frame_id)
+                    if not track.occluded:
+                        self.employee_registry.add_features(new_emp_id, track.curr_feat, self.frame_id)
                     if face_feat is not None:
                         self.face_registry.add_features(new_emp_id, face_feat, self.frame_id, face_pose_label, self.video_time)
                         track.face_pending_verify = False
@@ -1020,8 +1084,9 @@ class BoTSORT(object):
             track.employee_id = emp_id
             track.face_pending_verify = True  # Body-only re-match, needs face verification
             self._remove_lost_tracks_holding(emp_id, track)
-            self.employee_registry.refresh_feature(emp_id, feat_idx, track.curr_feat, self.frame_id)
-            self.employee_registry.prune_gallery(emp_id, track.curr_feat)
+            if not track.occluded:
+                self.employee_registry.refresh_feature(emp_id, feat_idx, track.curr_feat, self.frame_id)
+                self.employee_registry.prune_gallery(emp_id, track.curr_feat)
         else:
             # No match found — mark as gray, wait for stable re-match
             # Don't create new employee immediately, let _collect_features_to_registry handle it

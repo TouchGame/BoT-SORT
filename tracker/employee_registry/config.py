@@ -13,7 +13,7 @@ class EmployeeRegistryConfig:
     # Feature collection criteria
     MIN_TRACK_LENGTH = 15          # Minimum frames before collecting features
     MIN_DETECTION_CONFIDENCE = 0.7 # Minimum detection score for feature collection
-    MAX_OCCLUSION_RATIO = 0.3      # Maximum allowed occlusion ratio
+    MAX_OCCLUSION_RATIO = 0.5      # Maximum allowed occlusion ratio
 
     # Feature deduplication
     DEDUP_SIMILARITY_THRESHOLD = 0.85  # Features with cosine similarity > this are considered duplicates
@@ -39,8 +39,8 @@ class EmployeeRegistryConfig:
     PRUNE_DISTANCE_THRESHOLD = 0.6     # Remove gallery features with distance > this after match
 
     # Re-activation identity verification
-    REID_VERIFY_THRESHOLD = 0.45       # Check A: max distance between curr_feat and old smooth_feat
-    REID_VERIFY_THRESHOLD_B = 0.5      # Check B: max distance between curr_feat and employee gallery
+    REID_VERIFY_THRESHOLD = 0.30       # Check A: max distance between curr_feat and old smooth_feat
+    REID_VERIFY_THRESHOLD_B = 0.35     # Check B: max distance between curr_feat and employee gallery
 
     # Model paths (to be set from args)
     CONFIG_FILE = ""

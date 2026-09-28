@@ -18,6 +18,8 @@ class FaceRegistryConfig:
 
     # Identity matching
     MATCH_THRESHOLD = 0.5
+    SMALL_FACE_SIZE = 30               # 人脸短边 < 该值视为小脸
+    SMALL_FACE_MATCH_THRESHOLD = 0.65  # 小脸特征质量低，放宽匹配阈值
     MIN_GALLERY_SIZE = 1
 
     # Gallery management
